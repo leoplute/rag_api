@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+.venv/
+
+# Project-specific ignored dirs and files
+chroma_db/
+memory/
+.vscode/
+uv.lock
