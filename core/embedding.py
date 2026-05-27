@@ -2,7 +2,7 @@
 # Chunks a document, gets embeddings for each chunk via ollama, and stores them in ChromaDB.
 
 from core.ollama_client import get_embedding
-from core.vector_store import add_chunks, query_collection
+from core.vector_store import add_chunks, delete_file_chunks, query_collection
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
@@ -33,7 +33,8 @@ async def embed_document(text: str, filename: str, collection_name: str) -> int:
     embeddings = [await get_embedding(chunk) for chunk in chunks]
 
     ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
-    add_chunks(collection_name, chunks, embeddings, ids)
+    metadatas = [{"source": filename} for _ in chunks]
+    add_chunks(collection_name, chunks, embeddings, ids, metadatas)
 
     return len(chunks)
 
@@ -43,7 +44,7 @@ async def embed_document(text: str, filename: str, collection_name: str) -> int:
 #         n_results (int) - how many chunks to return
 # Returns: list of relevant text chunk strings
 async def retrieve_context(
-    query: str, collection_name: str, n_results: int = 5
+    query: str, collection_name: str, n_results: int = 10
 ) -> list[str]:
     query_embedding = await get_embedding(query)
     return query_collection(collection_name, query_embedding, n_results)

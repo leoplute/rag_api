@@ -5,6 +5,7 @@ from fastapi import APIRouter, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from core.embedding import embed_document, retrieve_context
+from core.vector_store import delete_file_chunks, list_collection_files, list_collections
 from core.ollama_client import send_chat_message
 
 router = APIRouter()
@@ -35,8 +36,10 @@ async def chat(body: ChatRequest):
 
         context = "\n\n".join(chunks)
         message = (
-            f"Use the following context to answer the question. "
-            f"If the context doesn't contain relevant information, answer from your general knowledge.\n\n"
+            f"Answer the question using the provided context. "
+            f"The context is authoritative and up-to-date — trust it over your training data, "
+            f"even if it conflicts with what you already know. "
+            f"If the context contains no relevant information, say so briefly.\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {body.message}"
         )
@@ -53,6 +56,12 @@ class EmbedResponse(BaseModel):
     collection_name: str
     filename: str
     chunks_added: int
+
+
+class DeleteEmbedResponse(BaseModel):
+    collection_name: str
+    filename: str
+    chunks_deleted: int
 
 
 # Accepts a .txt file and a collection name, chunks and embeds the content into ChromaDB.
@@ -76,3 +85,68 @@ async def embed_file(file: UploadFile, collection_name: str = Form(...)):
         filename=file.filename,
         chunks_added=chunks_added,
     )
+
+
+# Removes all embedded chunks for a specific file from a named collection.
+# Params: collection_name (str) - the ChromaDB collection to target,
+#         filename (str) - the exact filename used when the file was originally embedded
+# Returns: DeleteEmbedResponse with collection name, filename, and number of chunks removed
+@router.delete("/embed", response_model=DeleteEmbedResponse)
+async def delete_embedded_file(collection_name: str, filename: str):
+    try:
+        chunks_deleted = delete_file_chunks(collection_name, filename)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Delete error: {str(e)}")
+
+    if chunks_deleted == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No chunks found for '{filename}' in collection '{collection_name}'",
+        )
+
+    return DeleteEmbedResponse(
+        collection_name=collection_name,
+        filename=filename,
+        chunks_deleted=chunks_deleted,
+    )
+
+
+class CollectionSummary(BaseModel):
+    name: str
+    chunk_count: int
+
+
+class CollectionListResponse(BaseModel):
+    collections: list[CollectionSummary]
+
+
+# Returns all ChromaDB collections and the number of chunks stored in each.
+# Returns: CollectionListResponse containing a list of collection names and chunk counts
+@router.get("/collections", response_model=CollectionListResponse)
+async def get_collections():
+    try:
+        results = list_collections()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ChromaDB error: {str(e)}")
+
+    return CollectionListResponse(
+        collections=[CollectionSummary(**c) for c in results]
+    )
+
+
+class CollectionFilesResponse(BaseModel):
+    collection_name: str
+    files: list[str]
+
+
+# Returns the distinct source filenames embedded in a specific collection.
+# Params: name (str) - the collection name from the URL path
+# Returns: CollectionFilesResponse with the collection name and list of filenames
+@router.get("/collections/{name}/files", response_model=CollectionFilesResponse)
+async def get_collection_files(name: str):
+    try:
+        files = list_collection_files(name)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ChromaDB error: {str(e)}")
+
+    return CollectionFilesResponse(collection_name=name, files=files)
