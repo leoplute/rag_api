@@ -74,15 +74,46 @@ def delete_file_chunks(collection_name: str, filename: str) -> int:
     return len(ids_to_delete)
 
 
-# Queries a collection for the most semantically similar chunks to a given embedding.
+# Queries a collection and returns the full result dict including IDs, metadata, and distances.
+# Queries for more candidates than requested to account for question-type entries.
 # Params: collection_name (str), query_embedding (list of floats),
-#         n_results (int) - number of top chunks to return
-# Returns: list of matching text chunk strings
-def query_collection(
+#         n_results (int) - target number of unique chunks to eventually return,
+#         where (dict | None) - optional ChromaDB metadata filter
+# Returns: dict with "ids", "documents", "metadatas", and "distances" lists
+def query_collection_raw(
     collection_name: str,
     query_embedding: list[float],
     n_results: int = 10,
-) -> list[str]:
+    where: dict | None = None,
+) -> dict:
     collection = get_or_create_collection(collection_name)
-    results = collection.query(query_embeddings=[query_embedding], n_results=n_results)
-    return results["documents"][0]
+
+    # Fetch extra candidates to compensate for question-type entries that need dereference
+    fetch_n = min(n_results * 3, collection.count())
+    if fetch_n == 0:
+        return {"ids": [], "documents": [], "metadatas": [], "distances": []}
+
+    query_kwargs: dict = {
+        "query_embeddings": [query_embedding],
+        "n_results": fetch_n,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        query_kwargs["where"] = where
+
+    results = collection.query(**query_kwargs)
+    return {
+        "ids": results["ids"][0],
+        "documents": results["documents"][0],
+        "metadatas": results["metadatas"][0],
+        "distances": results["distances"][0],
+    }
+
+
+# Fetches document texts for a list of chunk IDs.
+# Params: collection_name (str), ids (list of str) - chunk IDs to look up
+# Returns: dict mapping chunk ID to document text
+def get_documents_by_ids(collection_name: str, ids: list[str]) -> dict[str, str]:
+    collection = get_or_create_collection(collection_name)
+    results = collection.get(ids=ids, include=["documents"])
+    return dict(zip(results["ids"], results["documents"]))

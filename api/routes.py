@@ -1,9 +1,9 @@
 # Defines all API endpoints for the RAG API.
-# Currently exposes a basic chat endpoint that forwards messages to the local ollama model.
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from core.analytics import get_collection_analytics
 from core.embedding import embed_document, retrieve_context
 from core.vector_store import delete_file_chunks, list_collection_files, list_collections
 from core.ollama_client import send_chat_message
@@ -14,26 +14,39 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     message: str
     collection_name: str | None = None
+    collection_names: list[str] | None = None
 
 
 class ChatResponse(BaseModel):
     response: str
     model: str
+    confidence: float | None = None
 
 
 # Accepts a user message and returns a response from the local llama3.2:3b model.
-# Params: body (ChatRequest) - contains the user's message string
-# Returns: ChatResponse with the assistant's reply and the model name used
+# If collection_name or collection_names is provided, retrieves relevant context first.
+# Params: body (ChatRequest) - message and optional collection(s) to ground the response in
+# Returns: ChatResponse with the assistant's reply, model name, and confidence score
 @router.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest):
-    message = body.message
+    # Resolve which collections to search — collection_names takes priority over collection_name
+    collections: list[str] = []
+    if body.collection_names:
+        collections = body.collection_names
+    elif body.collection_name:
+        collections = [body.collection_name]
 
-    if body.collection_name:
+    message = body.message
+    confidence: float | None = None
+
+    if collections:
         try:
-            chunks = await retrieve_context(body.message, body.collection_name)
+            result = await retrieve_context(body.message, collections)
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Retrieval error: {str(e)}")
 
+        chunks = result["chunks"]
+        confidence = result["confidence"]
         context = "\n\n".join(chunks)
         message = (
             f"Answer the question using the provided context. "
@@ -49,13 +62,20 @@ async def chat(body: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Ollama error: {str(e)}")
 
-    return ChatResponse(response=reply, model="llama3.2:3b")
+    return ChatResponse(response=reply, model="llama3.2:3b", confidence=confidence)
+
+
+class Contradiction(BaseModel):
+    new_chunk_preview: str
+    conflicting_file: str
+    conflicting_chunk_preview: str
 
 
 class EmbedResponse(BaseModel):
     collection_name: str
     filename: str
     chunks_added: int
+    contradictions: list[Contradiction]
 
 
 class DeleteEmbedResponse(BaseModel):
@@ -65,9 +85,10 @@ class DeleteEmbedResponse(BaseModel):
 
 
 # Accepts a .txt file and a collection name, chunks and embeds the content into ChromaDB.
+# Also generates hypothetical questions per chunk and scans for contradictions.
 # Params: file (UploadFile) - the text file to embed,
 #         collection_name (str) - the ChromaDB collection to store chunks in
-# Returns: EmbedResponse with the collection name, filename, and number of chunks added
+# Returns: EmbedResponse with chunk count and any contradictions found
 @router.post("/embed", response_model=EmbedResponse)
 async def embed_file(file: UploadFile, collection_name: str = Form(...)):
     if not file.filename.endswith(".txt"):
@@ -76,14 +97,15 @@ async def embed_file(file: UploadFile, collection_name: str = Form(...)):
     text = (await file.read()).decode("utf-8")
 
     try:
-        chunks_added = await embed_document(text, file.filename, collection_name)
+        result = await embed_document(text, file.filename, collection_name)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Embedding error: {str(e)}")
 
     return EmbedResponse(
         collection_name=collection_name,
         filename=file.filename,
-        chunks_added=chunks_added,
+        chunks_added=result["chunks_added"],
+        contradictions=[Contradiction(**c) for c in result["contradictions"]],
     )
 
 
@@ -150,3 +172,30 @@ async def get_collection_files(name: str):
         raise HTTPException(status_code=503, detail=f"ChromaDB error: {str(e)}")
 
     return CollectionFilesResponse(collection_name=name, files=files)
+
+
+class FileStats(BaseModel):
+    filename: str
+    retrieval_count: int
+
+
+class CollectionAnalyticsResponse(BaseModel):
+    collection_name: str
+    file_stats: list[FileStats]
+    dead_files: list[str]
+    total_tracked_retrievals: int
+
+
+# Returns retrieval analytics for a collection: per-file hit counts and files never retrieved.
+# Dead files are embedded documents whose chunks have never been surfaced in a chat query.
+# Params: name (str) - the collection name from the URL path
+# Returns: CollectionAnalyticsResponse
+@router.get("/collections/{name}/analytics", response_model=CollectionAnalyticsResponse)
+async def get_analytics(name: str):
+    try:
+        embedded_files = list_collection_files(name)
+        analytics = get_collection_analytics(name, embedded_files)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Analytics error: {str(e)}")
+
+    return CollectionAnalyticsResponse(**analytics)
